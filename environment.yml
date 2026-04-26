@@ -12,7 +12,9 @@ dependencies:
   - scipy>=1.5.0
   - tensorboard>=2.2.1
   - pybind11 # conda install -c conda-forge pybind11
+  - pip<24.1
   - pip:
     - inputs == 0.5
     - hydra-core == 1.1.0
     - omegaconf == 2.1
+    - setuptools==59.5.0

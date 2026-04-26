@@ -1,6 +1,6 @@
 # Note for MIT Cheetah Software Installation
 
-Ubuntu 18.04 LTS
+Tested on Ubuntu 20.04
 
 ## Dependencies
 
@@ -11,7 +11,7 @@ Ubuntu 18.04 LTS
     ./qt-unified-linux-x64-4.1.1-online.run
     ```
     After registration, install **qt5.10.0** newer (requires the gamepad library).
-    NOTE: on Ubuntu 18.10 or 20.04, you may instead install Qt with
+    NOTE: on Ubuntu 20.04, you may instead install Qt with
     ```
     sudo apt install libqt5 libqt5gamepad5
     ```
