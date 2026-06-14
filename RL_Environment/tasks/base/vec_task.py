@@ -68,6 +68,8 @@ class Env(ABC):
                 config["sim"]["use_gpu_pipeline"] = False
 
         self.rl_device = config.get("rl_device", "cuda:0")
+        self.rl_device = 'cpu'
+        self.device = 'cpu'
 
         # Rendering
         # if training in a headless mode

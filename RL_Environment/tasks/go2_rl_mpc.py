@@ -1,3 +1,19 @@
+"""
+go2_rl_mpc.py — RL 高层 + MPC 底层混合控制
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+架构设计：
+  RL Policy (高层): 输出 COM 偏移量 [dx, dy, dz] (3 维)
+  MPC Controller (底层): 根据 COM 偏移计算关节控制 (12 维)
+
+COM 输出范围：
+  x: [-0.05, 0.05] 米 (前后)
+  y: [-0.05, 0.05] 米 (左右)
+  z: [-0.04, 0.02] 米 (上下)
+
+使用 Go1 URDF 近似 Go2 真机
+"""
+
 import numpy as np
 import os
 import torch
@@ -10,20 +26,36 @@ from isaacgym import gymapi
 from isaacgym.torch_utils import *
 
 from MPC_Controller.common.Quadruped import RobotType
-from MPC_Controller.robot_runner.RobotRunnerFSM import RobotRunnerFSM
 from MPC_Controller.robot_runner.RobotRunnerMin import RobotRunnerMin
 from MPC_Controller.Parameters import Parameters
 from MPC_Controller.utils import DTYPE
 
-from RL_Environment.sim_utils import ALIENGO, add_random_uniform_terrain, add_uneven_terrains
+from RL_Environment.sim_utils import GO1, add_random_uniform_terrain, add_uneven_terrains
 from .base.vec_task import VecTask
 
 
-class Aliengo(VecTask):
+class Go2RLMPC(VecTask):
+    """
+    RL+MPC 混合控制环境
+    RL 输出 COM 偏移，MPC 执行具体控制
+    """
 
     def __init__(self, cfg, sim_device, graphics_device_id, headless):
-
         self.cfg = cfg
+        
+        # ==================== RL 输出 COM 范围（绝对位置，与mpc_walk1.py一致）====================
+        self.com_x_range = [0.023, 0.27]   # 绝对X位置（与BalanceController.NOM_X配合）
+        self.com_y_range = [0.063, 0.067]   # 绝对Y位置（与BalanceController.NOM_Y配合）
+        self.com_z_range = [-0.01, 0.01]    # 绝对Z位置
+        
+        # COM 缩放参数：action [-1,1] → com_position [min, max]
+        # formula: com = (action + 1) / 2 * (max - min) + min
+        self.com_x_scale = (self.com_x_range[1] - self.com_x_range[0]) / 2
+        self.com_x_bias = (self.com_x_range[1] + self.com_x_range[0]) / 2
+        self.com_y_scale = (self.com_y_range[1] - self.com_y_range[0]) / 2
+        self.com_y_bias = (self.com_y_range[1] + self.com_y_range[0]) / 2
+        self.com_z_scale = (self.com_z_range[1] - self.com_z_range[0]) / 2
+        self.com_z_bias = (self.com_z_range[1] + self.com_z_range[0]) / 2
         
         # normalization
         self.lin_vel_scale = self.cfg["env"]["learn"]["linearVelocityScale"]
@@ -40,6 +72,9 @@ class Aliengo(VecTask):
         self.rew_scales["lin_vel_z"] = self.cfg["env"]["learn"]["linearVelocityZRewardScale"] 
         self.rew_scales["ang_vel_xy"] = self.cfg["env"]["learn"]["angularVelocityXYRewardScale"] 
         self.rew_scales["collision"] = self.cfg["env"]["learn"]["kneeCollisionRewardScale"]
+        # 新增：三足站立稳定性奖励
+        self.rew_scales["tripod_stability"] = self.cfg["env"]["learn"].get("tripodStabilityRewardScale", 1.0)
+        self.rew_scales["com_penalty"] = self.cfg["env"]["learn"].get("comPenaltyRewardScale", 0.1)
 
         # command ranges
         self.command_x_range = self.cfg["env"]["randomCommandVelocityRanges"]["linear_x"]
@@ -63,8 +98,9 @@ class Aliengo(VecTask):
         # default joint positions
         self.named_default_joint_angles = self.cfg["env"]["defaultJointAngles"]
 
-        self.cfg["env"]["numObservations"] = 48
-        self.cfg["env"]["numActions"] = 12
+        # ★ 关键修改：numActions = 3 (COM 偏移), numObservations = 45
+        self.cfg["env"]["numObservations"] = 45
+        self.cfg["env"]["numActions"] = 3
 
         super().__init__(config=self.cfg, sim_device=sim_device, graphics_device_id=graphics_device_id, headless=headless)
 
@@ -90,21 +126,18 @@ class Aliengo(VecTask):
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
         torques = torch.zeros(self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
-        # torques = self.gym.acquire_dof_force_tensor(self.sim)
 
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
-        # self.gym.refresh_dof_force_tensor(self.sim)
 
         # create some wrapper tensors for different slices
         self.root_states = gymtorch.wrap_tensor(actor_root_state)
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
-        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)  # shape: num_envs, num_bodies, xyz axis
+        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
         self.torques = torques
-        # self.torques = gymtorch.wrap_tensor(torques).view(self.num_envs, self.num_dof)
 
         self.commands = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
         self.commands_y = self.commands.view(self.num_envs, 3)[..., 1]
@@ -122,7 +155,13 @@ class Aliengo(VecTask):
         self.initial_root_states = self.root_states.clone()
         self.initial_root_states[:] = to_torch(self.base_init_state, device=self.device, requires_grad=False)
         self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
+        
+        # ★ RL actions: 3 维 COM 偏移
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
+        
+        # MPC controllers
+        self.controllers = []
+        self.robotType = RobotType.GO1  # 使用 Go1 近似 Go2
 
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
 
@@ -144,23 +183,15 @@ class Aliengo(VecTask):
 
     def _create_envs(self, num_envs, spacing, num_per_row):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../assets')
-        asset_file = ALIENGO
-        #asset_path = os.path.join(asset_root, asset_file)
-        #asset_root = os.path.dirname(asset_path)
-        #asset_file = os.path.basename(asset_path)
+        asset_file = GO1  # 使用 Go1 URDF 近似 Go2
 
         asset_options = gymapi.AssetOptions()
         asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
-        # asset_options.collapse_fixed_joints = True
-        # asset_options.replace_cylinder_with_capsule = True
         asset_options.flip_visual_attachments = True
         asset_options.fix_base_link = self.cfg["env"]["urdfAsset"]["fixBaseLink"]
-        # asset_options.density = 0.001
         asset_options.angular_damping = 0.0
         asset_options.linear_damping = 0.0
         asset_options.armature = 0.01
-        # asset_options.thickness = 0.01
-        # asset_options.disable_gravity = False
         asset_options.use_mesh_materials = True
 
         robot_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
@@ -183,37 +214,26 @@ class Aliengo(VecTask):
 
         dof_props = self.gym.get_asset_dof_properties(robot_asset)
         for i in range(self.num_dof):
-            # *force control
             dof_props['driveMode'][i] = gymapi.DOF_MODE_EFFORT
             dof_props['stiffness'][i] = 0.0
             dof_props['damping'][i] = 0.0
-            # *position control
-            # dof_props['driveMode'][i] = gymapi.DOF_MODE_POS
-            # dof_props['stiffness'][i] = self.cfg["env"]["control"]["stiffness"] #self.Kp
-            # dof_props['damping'][i] = self.cfg["env"]["control"]["damping"] #self.Kd
 
         env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
         env_upper = gymapi.Vec3(spacing, spacing, spacing)
         self.actor_handles = []
         self.envs = []
-        # *MPC controller handles
-        self.controllers = []
-        self.robotType = RobotType.ALIENGO
 
         for i in range(self.num_envs):
-            # create env instance
             env_ptr = self.gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             robot_handle = self.gym.create_actor(env_ptr, robot_asset, start_pose, "robot", i, 1, 0)
             self.gym.set_actor_dof_properties(env_ptr, robot_handle, dof_props)
-            # self.gym.enable_actor_dof_force_sensors(env_ptr, robot_handle)
             self.envs.append(env_ptr)
             self.actor_handles.append(robot_handle)
-
-            if Parameters.bridge_MPC_to_RL:
-                # *MPC create controllers
-                robotRunner = RobotRunnerMin()
-                robotRunner.init(self.robotType)
-                self.controllers.append(robotRunner)
+            
+            # 创建 MPC 控制器
+            robotRunner = RobotRunnerMin()
+            robotRunner.init(self.robotType)
+            self.controllers.append(robotRunner)
 
         for i in range(len(feet_names)):
             self.feet_indices[i] = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], feet_names[i])
@@ -225,61 +245,37 @@ class Aliengo(VecTask):
         self.base_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], "trunk")
 
     def pre_physics_step(self, actions):
+        """
+        RL 动作 → COM 偏移 → MPC 控制 → 关节力矩
+        """
         self.actions = actions.clone().to(self.device)
-        if Parameters.bridge_MPC_to_RL:
-            # *MPC control
-            # actions: (num_envs, 12) [-1, 1]
-            # torques: (num_envs, num_dofs)
-            # dof_state: (num_envs*num_dofs, 2)
-            # root_states: (num_envs, pos[3]+quat[4]+lin_vel[3]+ang_vel[3])
-            # commands: (num_envs, 3)
-            # * [-1, 1] -> [a, b] => [-1, 1] * (b-a)/2 + (b+a)/2
-            actions_rescale = torch.mul(self.actions, 
-                                        torch.tensor(
-                                        Parameters.MPC_param_scale,
-                                        dtype=torch.float,
-                                        device=self.device)).add(
-                                        torch.tensor(
-                                        Parameters.MPC_param_const,
-                                        dtype=torch.float,
-                                        device=self.device))
+        
+        # 1. RL 动作解码：[-1, 1] → COM 偏移
+        com_x = self.actions[:, 0:1] * self.com_x_scale + self.com_x_bias
+        com_y = self.actions[:, 1:2] * self.com_y_scale + self.com_y_bias
+        com_z = self.actions[:, 2:3] * self.com_z_scale + self.com_z_bias
+        com_offset = torch.cat([com_x, com_y, com_z], dim=1)  # [num_envs, 3]
+        
+        # 2. MPC 控制
+        torques_cpu = np.zeros((self.num_envs, self.num_dof), dtype=DTYPE)
+        
+        for idx, controller in enumerate(self.controllers):
+            # 构建 MPC 命令：[vx, vy, yaw, com_x, com_y, com_z, mode]
+            mpc_commands = np.concatenate((
+                self.commands[idx].cpu().numpy(),  # [vx, vy, yaw]
+                com_offset[idx].cpu().numpy(),    # [com_x, com_y, com_z]
+                [1.0]  # mode: 1=locomotion
+            ), axis=0).astype(DTYPE)
             
-            # CPU/GPU aware data transfer
-            if self.device == 'cpu':
-                # CPU mode: no need for cpu() conversion
-                actions_np = actions_rescale.detach().numpy().astype(DTYPE)
-                dof_state_np = self.dof_state.detach().numpy().astype(DTYPE)
-                root_states_np = self.root_states.detach().numpy().astype(DTYPE)
-                commands_np = self.commands.detach().numpy().astype(DTYPE)
-            else:
-                # GPU mode: transfer to CPU for MPC
-                actions_np = actions_rescale.detach().cpu().numpy().astype(DTYPE)
-                dof_state_np = self.dof_state.detach().cpu().numpy().astype(DTYPE)
-                root_states_np = self.root_states.detach().cpu().numpy().astype(DTYPE)
-                commands_np = self.commands.detach().cpu().numpy().astype(DTYPE)
-            
-            torques_cpu = np.zeros((self.num_envs, self.num_dof), dtype=DTYPE)
-            for idx, controller in enumerate(self.controllers):
-                commands = np.concatenate((commands_np[idx], actions_np[idx], [0.0]), axis=0).astype(DTYPE)
-                torques_cpu[idx] = controller.run(dof_state_np[idx*self.num_dof:(idx+1)*self.num_dof],
-                                                  root_states_np[idx],
-                                                  commands)
+            torques_cpu[idx] = controller.run(
+                self.dof_state[idx*self.num_dof:(idx+1)*self.num_dof].cpu().numpy().astype(DTYPE),
+                self.root_states[idx].cpu().numpy().astype(DTYPE),
+                mpc_commands
+            )
 
-            # Transfer torques back to device
-            torques_tensor = torch.from_numpy(torques_cpu.astype(np.float32)).to(self.device)
-            # *maybe clip output torques is not a good idea in training
-            # *causing weird forward motion 
-            # self.torques = torch.clip(torques_gpu, -55., 55.) 
-            self.torques = torques_tensor
-            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
-        else:
-            # *force control
-            torques = torch.clip(self.Kp*(self.action_scale*self.actions + self.default_dof_pos - self.dof_pos) - self.Kd*self.dof_vel,
-                            -55., 55.)
-            self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torques))
-            # *position control
-            # targets = self.action_scale * self.actions + self.default_dof_pos
-            # self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(targets))
+        torques_tensor = torch.from_numpy(torques_cpu.astype(np.float32)).to(self.device)
+        self.torques = torques_tensor
+        self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(self.torques))
 
     def post_physics_step(self):
         self.progress_buf += 1
@@ -293,7 +289,6 @@ class Aliengo(VecTask):
 
     def compute_reward(self, actions):
         self.rew_buf[:], self.reset_buf[:] = compute_robot_reward(
-            # tensors
             self.root_states,
             self.commands,
             self.torques,
@@ -301,32 +296,36 @@ class Aliengo(VecTask):
             self.knee_indices,
             self.hip_indices,
             self.progress_buf,
-            # Dict
-            self.rew_scales,
-            # other
             self.base_index,
             self.max_episode_length,
+            actions,  # COM 动作
+            self.rew_scales["lin_vel_xy"],
+            self.rew_scales["ang_vel_z"],
+            self.rew_scales["lin_vel_z"],
+            self.rew_scales["ang_vel_xy"],
+            self.rew_scales["collision"],
+            self.rew_scales["torque"],
+            self.rew_scales["com_penalty"],
+            self.rew_scales["tripod_stability"]
         )
 
     def compute_observations(self):
-        self.gym.refresh_dof_state_tensor(self.sim)  # done in step
+        self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
-        # self.gym.refresh_dof_force_tensor(self.sim)
 
-        self.obs_buf[:] = compute_robot_observations(  # tensors
-                                                        self.root_states,
-                                                        self.commands,
-                                                        self.dof_pos,
-                                                        self.default_dof_pos,
-                                                        self.dof_vel,
-                                                        self.gravity_vec,
-                                                        self.actions,
-                                                        # scales
-                                                        self.lin_vel_scale,
-                                                        self.ang_vel_scale,
-                                                        self.dof_pos_scale,
-                                                        self.dof_vel_scale
+        self.obs_buf[:] = compute_robot_observations(
+            self.root_states,
+            self.commands,
+            self.dof_pos,
+            self.default_dof_pos,
+            self.dof_vel,
+            self.gravity_vec,
+            self.actions,
+            self.lin_vel_scale,
+            self.ang_vel_scale,
+            self.dof_pos_scale,
+            self.dof_vel_scale
         )
 
     def reset_idx(self, env_ids):
@@ -337,24 +336,22 @@ class Aliengo(VecTask):
         self.dof_vel[env_ids] = velocities
 
         env_ids_int32 = env_ids.to(dtype=torch.int32)
-        if Parameters.bridge_MPC_to_RL:
-            # *MPC reset
-            # print(env_ids_int32.cpu())
-            # torch.cuda.synchronize()
-            for idx in env_ids_int32.detach().cpu():
-                self.controllers[idx].reset()
+        
+        for idx in env_ids_int32.detach().cpu():
+            self.controllers[idx].reset()
 
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.initial_root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                                      gymtorch.unwrap_tensor(self.initial_root_states),
+                                                      gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
         self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self.dof_state),
-                                              gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                               gymtorch.unwrap_tensor(self.dof_state),
+                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
 
-        self.commands_x[env_ids] = torch_rand_float(self.command_x_range[0], self.command_x_range[1], (len(env_ids), 1), device=self.device).squeeze()
-        self.commands_y[env_ids] = torch_rand_float(self.command_y_range[0], self.command_y_range[1], (len(env_ids), 1), device=self.device).squeeze()
-        self.commands_yaw[env_ids] = torch_rand_float(self.command_yaw_range[0], self.command_yaw_range[1], (len(env_ids), 1), device=self.device).squeeze()
+        # 速度命令：缓慢行走
+        self.commands_x[env_ids] = torch_rand_float(-0.2, 0.2, (len(env_ids), 1), device=self.device).squeeze()
+        self.commands_y[env_ids] = torch_rand_float(-0.1, 0.1, (len(env_ids), 1), device=self.device).squeeze()
+        self.commands_yaw[env_ids] = torch_rand_float(-0.2, 0.2, (len(env_ids), 1), device=self.device).squeeze()
 
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 1
@@ -364,10 +361,8 @@ class Aliengo(VecTask):
 ###=========================jit functions=========================###
 #####################################################################
 
-
 @torch.jit.script
 def compute_robot_reward(
-    # tensors
     root_states,
     commands,
     torques,
@@ -375,44 +370,56 @@ def compute_robot_reward(
     knee_indices,
     hip_indices,
     episode_lengths,
-    # Dict
-    rew_scales,
-    # other
     base_index,
-    max_episode_length
+    max_episode_length,
+    actions,  # COM 动作 [3]
+    rew_lin_vel_xy_scale,
+    rew_ang_vel_z_scale,
+    rew_lin_vel_z_scale,
+    rew_ang_vel_xy_scale,
+    rew_collision_scale,
+    rew_torque_scale,
+    rew_com_penalty_scale,
+    rew_tripod_stability_scale
 ):
-    # (reward, reset, feet_in air, feet_air_time, episode sums)
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, float], int, int) -> Tuple[Tensor, Tensor]
-
-    # prepare quantities (TODO: return from obs ?)
     base_quat = root_states[:, 3:7]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10])
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13])
 
-    # velocity tracking reward
+    # 速度跟踪奖励
     lin_vel_error = torch.sum(torch.square(commands[:, :2] - base_lin_vel[:, :2]), dim=1)
     ang_vel_error = torch.square(commands[:, 2] - base_ang_vel[:, 2])
-    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_scales["lin_vel_xy"]
-    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_scales["ang_vel_z"]
+    rew_lin_vel_xy = torch.exp(-lin_vel_error/0.25) * rew_lin_vel_xy_scale
+    rew_ang_vel_z = torch.exp(-ang_vel_error/0.25) * rew_ang_vel_z_scale
 
-    # other base velocity penalties
-    rew_lin_vel_z = torch.square(base_lin_vel[:, 2]) * rew_scales["lin_vel_z"]
-    rew_ang_vel_xy = torch.sum(torch.square(base_ang_vel[:, :2]), dim=1) * rew_scales["ang_vel_xy"]
+    # 其他速度惩罚
+    rew_lin_vel_z = torch.square(base_lin_vel[:, 2]) * rew_lin_vel_z_scale
+    rew_ang_vel_xy = torch.sum(torch.square(base_ang_vel[:, :2]), dim=1) * rew_ang_vel_xy_scale
 
-    # collision penalty
+    # 碰撞惩罚
     knee_contact = torch.norm(contact_forces[:, knee_indices, :], dim=2) > 1.
-    rew_collision = torch.sum(knee_contact, dim=1) * rew_scales["collision"]
+    rew_collision = torch.sum(knee_contact, dim=1) * rew_collision_scale
 
-    # torque penalty
-    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_scales["torque"]
+    # 力矩惩罚
+    rew_torque = torch.sum(torch.square(torques), dim=1) * rew_torque_scale
+    
+    # COM 平滑性惩罚（鼓励平滑的 COM 变化）
+    com_penalty = torch.sum(torch.square(actions), dim=1) * rew_com_penalty_scale
+    
+    # 三足稳定性奖励：鼓励 roll/pitch 保持平稳
+    roll_pitch_error = torch.sum(torch.square(base_ang_vel[:, :2]), dim=1)
+    tripod_stability = torch.exp(-roll_pitch_error / 0.5) * rew_tripod_stability_scale
 
-    total_reward = rew_lin_vel_xy + rew_lin_vel_z + rew_ang_vel_xy + rew_ang_vel_z + rew_torque + rew_collision
+    total_reward = (rew_lin_vel_xy + rew_ang_vel_z + tripod_stability - 
+                    rew_lin_vel_z - rew_ang_vel_xy - rew_torque - 
+                    rew_collision - com_penalty)
     total_reward = torch.clip(total_reward, 0., None)
-    # reset agents
+    
+    # reset conditions
     reset = torch.norm(contact_forces[:, base_index, :], dim=1) > 1.
     reset = reset | torch.any(knee_contact, dim=1)
     reset = reset | torch.any(torch.norm(contact_forces[:, hip_indices, :], dim=2) > 1., dim=1)
-    time_out = episode_lengths > max_episode_length  # no terminal reward for time-outs
+    time_out = episode_lengths > max_episode_length
     reset = reset | time_out
 
     return total_reward.detach(), reset
@@ -431,25 +438,24 @@ def compute_robot_observations(root_states,
                                 dof_pos_scale,
                                 dof_vel_scale
                                 ):
-    # 
-    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, float, float, float, float) -> Tensor
     base_quat = root_states[:, 3:7]
     base_pos = root_states[:, 0:3]
     base_lin_vel = quat_rotate_inverse(base_quat, root_states[:, 7:10]) * lin_vel_scale
     base_ang_vel = quat_rotate_inverse(base_quat, root_states[:, 10:13]) * ang_vel_scale
-    # projected_gravity = quat_rotate(base_quat, gravity_vec)
     dof_pos_scaled = (dof_pos - default_dof_pos) * dof_pos_scale
 
-    commands_scaled = commands*torch.tensor([lin_vel_scale, lin_vel_scale, ang_vel_scale], requires_grad=False, device=commands.device)
+    commands_scaled = commands * torch.tensor([lin_vel_scale, lin_vel_scale, ang_vel_scale], 
+                                               requires_grad=False, device=commands.device)
 
+    # 观测：3+3+3+3+12+12+3 = 39 维
+    # base_pos(3) + base_lin_vel(3) + base_ang_vel(3) + commands(3) + 
+    # dof_pos(12) + dof_vel(12) + last_actions(3)
     obs = torch.cat((base_pos,
                      base_lin_vel,
                      base_ang_vel,
-                    #  projected_gravity,
                      commands_scaled,
                      dof_pos_scaled,
-                     dof_vel*dof_vel_scale,
-                     actions
-                     ), dim=-1)
+                     dof_vel * dof_vel_scale,
+                     actions), dim=-1)
 
     return obs

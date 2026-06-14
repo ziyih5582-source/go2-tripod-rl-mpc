@@ -1,0 +1,101 @@
+# Go2 RL+MPC 混合控制训练配置
+# RL 输出 COM 偏移，MPC 执行具体控制
+
+# 任务名称
+task_name: Go2RLMPC
+
+# 环境配置
+env:
+  numEnvs: 4096  # 并行环境数量
+  envSpacing: 3.0
+  numObservations: 39  # 39 维观测
+  numActions: 3  # 3 维 COM 偏移输出
+  
+  # 机器人初始状态
+  baseInitState:
+    pos: [0.0, 0.0, 0.42]  # 初始位置 (x, y, z)
+    rot: [1.0, 0.0, 0.0, 0.0]  # 初始四元数 (w, x, y, z)
+    vLinear: [0.0, 0.0, 0.0]  # 初始线速度
+    vAngular: [0.0, 0.0, 0.0]  # 初始角速度
+  
+  # 默认关节角度
+  defaultJointAngles:
+    FL_hip: 0.0
+    FL_thigh: 0.9
+    FL_calf: -1.8
+    FR_hip: 0.0
+    FR_thigh: 0.9
+    FR_calf: -1.8
+    RL_hip: 0.0
+    RL_thigh: 0.9
+    RL_calf: -1.8
+    RR_hip: 0.0
+    RR_thigh: 0.9
+    RR_calf: -1.8
+  
+  # URDF 配置
+  urdfAsset:
+    fixBaseLink: false
+  
+  # 随机速度命令范围
+  randomCommandVelocityRanges:
+    linear_x: [-0.2, 0.2]  # 缓慢前后移动
+    linear_y: [-0.1, 0.1]  # 缓慢左右移动
+    yaw: [-0.2, 0.2]       # 缓慢旋转
+  
+  # 学习参数
+  learn:
+    episodeLength_s: 20  # 每集时长 (秒)
+    linearVelocityScale: 2.0
+    angularVelocityScale: 0.25
+    dofPositionScale: 1.0
+    dofVelocityScale: 0.05
+    
+    # 奖励函数权重
+    linearVelocityXYRewardScale: 2.0
+    angularVelocityZRewardScale: 0.5
+    torqueRewardScale: 0.00001
+    linearVelocityZRewardScale: 2.0
+    angularVelocityXYRewardScale: 5.0
+    kneeCollisionRewardScale: 1.0
+    tripodStabilityRewardScale: 2.0  # 三足稳定性奖励
+    comPenaltyRewardScale: 0.1  # COM 平滑性惩罚
+  
+  # 平面参数
+  plane:
+    staticFriction: 1.0
+    dynamicFriction: 1.0
+    restitution: 0.0
+  
+  # 观察者配置
+  viewer:
+    pos: [10.0, 10.0, 5.0]
+    lookat: [0.0, 0.0, 0.0]
+  
+  # 控制配置
+  control:
+    actionScale: 1.0
+    stiffness: {}
+    damping: {}
+
+# 物理引擎配置
+physics_engine: 'physx'
+sim:
+  dt: 0.02
+  substeps: 1
+  gravity: [0.0, 0.0, -9.81]
+  up_axis: 'z'
+  use_gpu_pipeline: false
+  num_client_threads: 1
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 4
+    num_velocity_iterations: 0
+    contact_offset: 0.02
+    rest_offset: 0.0
+    sleep_threshold: 0.0
+    default_contact_offset: 0.02
+    max_gpu_contact_pairs: 33554432
+    num_subscenes: 4
+    use_gpu: false

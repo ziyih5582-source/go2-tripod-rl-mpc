@@ -1,0 +1,106 @@
+# Go2 RL+MPC 简化版训练配置
+# 基于 mpc_walk1.py 的简化 MPC 控制器 + RL 训练
+# RL 输出 COM 偏移，MPC 执行具体控制
+
+# 任务名称
+task_name: Go2RLMPCSimple
+
+# 环境配置
+env:
+  numEnvs: 64  # 并行环境数量（CPU 模式下适当减少，避免内存溢出）
+  envSpacing: 3.0
+  numObservations: 48  # 48 维观测
+  numActions: 3  # 3 维 COM 偏移输出 [dx, dy, dz]
+  
+  # URDF 配置
+  urdf_file: "go1_description/urdf/go1.urdf"
+  urdfAsset:
+    fixBaseLink: false
+  
+  # 平面配置
+  flat_ground: true
+  
+  # 机器人初始状态
+  baseInitState:
+    pos: [0.0, 0.0, 0.35]  # 初始位置 (x, y, z)
+    rot: [1.0, 0.0, 0.0, 0.0]  # 初始四元数 (w, x, y, z)
+    vLinear: [0.0, 0.0, 0.0]  # 初始线速度
+    vAngular: [0.0, 0.0, 0.0]  # 初始角速度
+  
+  # 默认关节角度（站立姿态）- 使用 URDF 中的实际关节名称
+  defaultJointAngles:
+    FL_hip_joint: 0.0
+    FL_thigh_joint: 0.9
+    FL_calf_joint: -1.8
+    FR_hip_joint: 0.0
+    FR_thigh_joint: 0.9
+    FR_calf_joint: -1.8
+    RL_hip_joint: 0.0
+    RL_thigh_joint: 0.9
+    RL_calf_joint: -1.8
+    RR_hip_joint: 0.0
+    RR_thigh_joint: 0.9
+    RR_calf_joint: -1.8
+   
+  # 随机速度命令范围
+  randomCommandVelocityRanges:
+    linear_x: [-0.3, 0.3]  # 前后移动速度范围
+    linear_y: [-0.2, 0.2]  # 左右移动速度范围
+    yaw: [-0.3, 0.3]       # 偏航角速度范围
+  
+  # 学习参数
+  learn:
+    episodeLength_s: 15  # 每集时长 (秒)
+    linearVelocityScale: 2.0
+    angularVelocityScale: 0.25
+    dofPositionScale: 1.0
+    dofVelocityScale: 0.05
+    
+    # 奖励函数权重
+    linearVelocityXYRewardScale: 2.0      # XY 速度跟踪奖励
+    angularVelocityZRewardScale: 0.5     # 偏航角速度奖励
+    torqueRewardScale: 0.00005           # 力矩惩罚
+    linearVelocityZRewardScale: 2.0     # 垂直速度惩罚
+    angularVelocityXYRewardScale: 5.0    # 横滚/俯仰惩罚
+    kneeCollisionRewardScale: 1.0       # 膝盖碰撞惩罚
+    tripodStabilityRewardScale: 2.0      # 三足稳定性奖励
+    comPenaltyRewardScale: 0.1          # COM 平滑性惩罚
+    actionSmoothRewardScale: 0.1         # 动作平滑性惩罚
+    heightPenaltyRewardScale: 0.5        # 高度惩罚
+   
+  # 平面参数
+  plane:
+    staticFriction: 1.0
+    dynamicFriction: 1.0
+    restitution: 0.0
+   
+  # 观察者配置
+  viewer:
+    pos: [10.0, 10.0, 5.0]
+    lookat: [0.0, 0.0, 0.0]
+   
+  # 控制配置
+  control:
+    actionScale: 1.0
+    stiffness: 50.0     # PD 刚度
+    damping: 2.5       # PD 阻尼
+
+# 物理引擎配置
+physics_engine: 'physx'
+sim:
+  dt: 0.02
+  substeps: 1
+  gravity: [0.0, 0.0, -9.81]
+  up_axis: 'z'
+  use_gpu_pipeline: false
+  num_client_threads: 1
+  physx:
+    num_threads: 2
+    solver_type: 1
+    num_position_iterations: 2
+    num_velocity_iterations: 0
+    contact_offset: 0.02
+    rest_offset: 0.0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: 2
+    use_gpu: false
