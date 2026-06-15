@@ -1,7 +1,7 @@
 # RL+MPC Locomotion — Three-Legged Walking on Unitree Go2
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/880dacb2-4bfe-4bfe-4638-8f5d-7ebad59bd951" controls muted autoplay loop width="85%"></video>
+  <video src="https://github.com/user-attachments/assets/bcbf84ad-6642-41f3-8578-b751ccd3ada8" controls muted autoplay loop width="85%"></video>
 </p>
 
 <p align="center">
