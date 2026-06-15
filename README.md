@@ -1,7 +1,7 @@
 # RL+MPC Locomotion — Three-Legged Walking on Unitree Go2
 
 <p align="center">
-  <video src="https://raw.githubusercontent.com/ziyih5582-source/go2-tripod-rl-mpc/main/images/real-3legged.mp4" controls muted autoplay loop width="85%"></video>
+  <video src="https://github.com/user-attachments/assets/880dacb2-4bfe-4bfe-4638-8f5d-7ebad59bd951" controls muted autoplay loop width="85%"></video>
 </p>
 
 <p align="center">
